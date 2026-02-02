@@ -1,0 +1,20 @@
+# E-Shop Template
+
+## Project Overview
+This represents an e-commerce platform built with Next.js, Shopify, and Firebase.
+
+## Key Routes
+- /: Home page
+- /search: Product catalog and search
+- /product/[handle]: Product details
+- /cart: Shopping cart
+- /checkout: Checkout flow
+
+## Tech Stack
+- Framework: Next.js 14+ (App Router)
+- Styling: Tailwind CSS
+- Data: Shopify Storefront API
+- Backend: Firebase (Auth, Firestore, Functions)
+
+## Documentation
+See /docs/00_master_index.md for full project documentation.

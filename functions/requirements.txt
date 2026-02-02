@@ -1,0 +1,6 @@
+firebase-functions
+firebase-admin
+google-generativeai
+httpx
+stripe
+# For AADE if needed, though we used standard xml
