@@ -1,11 +1,12 @@
 import os
 import json
 import tempfile
+import time
 from firebase_functions import https_fn, storage_fn, options
 from firebase_admin import firestore, storage, initialize_app
 from google import genai
 from google.genai import types
-import numpy as np
+from .config import AIConfig
 
 # Initialize Firebase if not already done
 try:
@@ -14,15 +15,16 @@ except ValueError:
     pass
 
 @storage_fn.on_object_finalized(
-    region="europe-west1",
-    memory=options.MemoryOption.MB_1024,
+    region=AIConfig.LOCATION,
+    memory=options.MemoryOption.GB_1,
     timeout_sec=540,
-    cpu=1
+    cpu=1,
+    bucket=os.environ.get("FIREBASE_STORAGE_BUCKET") # Dynamic bucket
 )
 def process_catalogue_upload(event: storage_fn.CloudEvent[storage_fn.StorageObjectData]):
     """
     Triggered when a file is uploaded to the catalogue bucket.
-    Extracts product data using Gemini and stores it in Firestore with vector embeddings.
+    Extracts product data using Gemini and stores it in Firestore 'product_drafts'.
     """
     bucket_name = event.data.bucket
     file_path = event.data.name
@@ -34,111 +36,113 @@ def process_catalogue_upload(event: storage_fn.CloudEvent[storage_fn.StorageObje
 
     db = firestore.client()
     bucket = storage.bucket(bucket_name)
-    blob = bucket.blob(file_path)
 
     print(f"Processing catalogue file: {file_path}")
 
     # Initialize Gemini Client
-    # Uses GOOGLE_APPLICATION_CREDENTIALS or api_key from env
     client = genai.Client(
         vertexai=True, 
-        project=os.environ.get("GOOGLE_CLOUD_PROJECT"), 
-        location=os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+        project=AIConfig.PROJECT_ID, 
+        location=AIConfig.LOCATION
     )
 
-    with tempfile.NamedTemporaryFile(suffix=os.path.splitext(file_path)[1]) as temp_file:
-        blob.download_to_filename(temp_file.name)
-        
-        # Upload to Gemini File API (or verify if we can pass bytes directly for some models)
-        # For simplicity with Vertex AI, we often use Part.from_data or Part.from_uri if in GCS
-        # Since it's already in GCS, we can try using the GCS URI directly if permissions allow.
-        # However, Storage triggers usually mean we can access the file. 
-        # Let's read the content for smaller files or use the GCS URI for larger ones.
-        # For this template, we'll read small files to keep it simple, or use GCS URI.
-        
-        gcs_uri = f"gs://{bucket_name}/{file_path}"
-        
-        # 1. Extract Product Data using Gemini 1.5 Flash
-        prompt = """
-        You are an expert e-commerce data entry specialist.
-        Analyze this catalogue file and extract ALL products found.
-        For each product, return a JSON object with:
-        - title: Product name
-        - description: Detailed description
-        - price: Price as a number (if found, else null)
-        - sku: SKU or identifier (if found, else null)
-        - tags: List of relevant category tags
-        
-        Return the response as a JSON list of objects.
-        """
-        
-        # Gemini 1.5 Flash is efficient for document processing
+    gcs_uri = f"gs://{bucket_name}/{file_path}"
+    blob = bucket.blob(file_path)
+    content_type = event.data.content_type
+
+    # 1. Extract Product Data using Gemini Long Context
+    # We use Long Context (passing the file URI directly) because we want ALL products.
+    # RAG (FileSearch) is better for querying specific info, not bulk extraction.
+    
+    prompt = """
+    You are an expert e-commerce data entry specialist.
+    Analyze this catalogue file and extract ALL products found.
+    For each product, return a JSON object with:
+    - title: Product name
+    - description: Detailed description (include material, care instructions if available)
+    - price: Price as a number (if found, else null)
+    - currency: Currency code (e.g., EUR, USD)
+    - sku: SKU or identifier (if found, else null)
+    - tags: List of relevant category tags (e.g. 'Men', 'Summer', 'Casual', 'Shirt')
+    - options: List of variants if available (e.g. sizes, colors)
+    
+    Return the response as a JSON object with a key "products" containing the list.
+    """
+    
+    try:
         response = client.models.generate_content(
-            model="gemini-1.5-flash-001",
+            model=AIConfig.MODEL_NAME,
             contents=[
                 types.Content(
                     role="user",
                     parts=[
-                        types.Part.from_uri(file_uri=gcs_uri, mime_type=event.data.content_type),
+                        types.Part.from_uri(file_uri=gcs_uri, mime_type=content_type),
                         types.Part.from_text(text=prompt)
                     ]
                 )
             ],
             config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                # JSON schema validation could be added here for stricter output
+                response_mime_type="application/json", 
+                temperature=0.1
             )
         )
+        products_data = json.loads(response.text)
+        if isinstance(products_data, dict):
+             products_data = products_data.get("products", [])
+        
+    except Exception as e:
+        print(f"Gemini Extraction Failed: {e}")
+        # Log failure logic here?
+        return
+
+    print(f"Extracted {len(products_data)} products.")
+
+    # 2. Store in Firestore 'product_drafts'
+    batch = db.batch()
+    
+    for product in products_data:
+        # Create Document Ref in DRAFTS
+        doc_ref = db.collection("product_drafts").document()
+        
+        # Generate embedding for the draft (for Agent searching later)
+        text_to_embed = f"{product.get('title', '')} {product.get('description', '')} {' '.join(product.get('tags', []))}"
         
         try:
-            products_data = json.loads(response.text)
-            if isinstance(products_data, dict):
-                 # Handle case where model returns {"products": [...]}
-                 products_data = products_data.get("products", [])
-        except json.JSONDecodeError:
-            print(f"Failed to parse JSON response: {response.text}")
-            return
-
-        print(f"Extracted {len(products_data)} products.")
-
-        # 2. Generate Embeddings & Store in Firestore
-        batch = db.batch()
-        
-        for product in products_data:
-            # Generate text embedding for semantic search
-            # Combine title, description, and tags for rich context
-            text_to_embed = f"{product.get('title', '')} {product.get('description', '')} {' '.join(product.get('tags', []))}"
-            
             embedding_resp = client.models.embed_content(
                 model="text-embedding-004",
                 contents=text_to_embed
             )
             embedding_vector = embedding_resp.embeddings[0].values
-            
-            # Create Document Ref
-            doc_ref = db.collection("products").document()
-            
-            product_doc = {
-                "title": product.get("title"),
-                "description": product.get("description"),
-                "price": product.get("price"),
-                "sku": product.get("sku"),
-                "tags": product.get("tags", []),
-                # Vector Field for Firestore Vector Search
-                "embedding_field": firestore.Vector(embedding_vector), 
-                "source_file": file_path,
-                "created_at": firestore.SERVER_TIMESTAMP,
-                "status": "active" # Ready for sale
-            }
-            
-            batch.set(doc_ref, product_doc)
-            
-            # Batch commit limit is 500
-            if len(batch) >= 400:
-                batch.commit()
-                batch = db.batch()
-        
-        if len(batch) > 0:
-            batch.commit()
+        except Exception:
+            embedding_vector = None # Proceed even if embedding fails
 
-        print("Catalogue processing complete.")
+        product_draft = {
+            "title": product.get("title"),
+            "description": product.get("description"),
+            "price": product.get("price"),
+            "currency": product.get("currency", "EUR"),
+            "sku": product.get("sku"),
+            "tags": product.get("tags", []),
+            "options": product.get("options", []),
+            
+            # Metadata
+            "source_file": file_path,
+            "source_gcs_uri": gcs_uri,
+            "status": "pending_review", # <--- Key Change
+            "created_at": firestore.SERVER_TIMESTAMP,
+            "ai_confidence": 0.85, # Placeholder or could be derived
+            
+            # Search
+            "embedding_field": firestore.Vector(embedding_vector) if embedding_vector else None
+        }
+        
+        batch.set(doc_ref, product_draft)
+        
+        if len(batch) >= 400:
+            batch.commit()
+            batch = db.batch()
+    
+    if len(batch) > 0:
+        batch.commit()
+
+    print("Catalogue processing complete. Drafts created.")

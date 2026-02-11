@@ -15,7 +15,7 @@ import {
 
 export const shopifyClient = createStorefrontApiClient({
     storeDomain: env.SHOPIFY_STORE_DOMAIN,
-    apiVersion: '2024-01',
+    apiVersion: '2025-04',
     publicAccessToken: env.SHOPIFY_STOREFRONT_ACCESS_TOKEN,
 });
 

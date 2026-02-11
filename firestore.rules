@@ -1,0 +1,48 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper function to check if user is admin
+    // We strictly check the 'role' field in their user document.
+    function isAdmin() {
+      return request.auth != null && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Helper for owner check
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    // 1. Users Collection
+    // Anyone can read their own profile. Admin can read all.
+    // Only owner can update preferences. Admin can update roles.
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow write: if isAdmin(); // Strictly admin for sensitive fields like role? 
+      // Let's allow owners to update basic info if needed, but for now restrict to admin to prevent role escalation.
+      // Re-thinking: If I let owner write, they might inject 'role: admin'.
+      // So, strict: ONLY Admin can write to users doc OR use a specific function.
+      // Actually, standard pattern: Allow update if requesting Resource data.role == resource.data.role (role doesn't change).
+      allow update: if isOwner(uid) && request.resource.data.role == resource.data.role;
+    }
+
+    // 2. Drafts (AI Staging)
+    // STRICTLY ADMIN. No one else should see these potential hallucinations.
+    match /product_drafts/{document=**} {
+      allow read, write: if isAdmin();
+    }
+
+    // 3. Live Live Products (The Store)
+    // Public Read. Admin Write.
+    match /products_live/{productId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // 4. Default Block (Safety Net)
+    match /{document=**} {
+      allow read, write: if false; 
+    }
+  }
+}

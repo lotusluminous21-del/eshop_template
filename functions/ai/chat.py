@@ -7,16 +7,23 @@ from google.genai import types
 import numpy as np
 
 # Initialize Firebase if not already done
-try:
-    initialize_app()
-except ValueError:
-    pass
+# Initialize Firebase if not already done - moved inside
+# try:
+#     initialize_app()
+# except ValueError:
+#     pass
 
 @https_fn.on_call(region="europe-west1", memory=options.MemoryOption.MB_512)
 def chat_assistant(req: https_fn.CallableRequest) -> dict:
     """
     AI Buyer Assistant that uses RAG to answer questions about products.
     """
+    # Lazy init
+    try:
+        initialize_app()
+    except ValueError:
+        pass
+
     # 1. Parse Request
     data = req.data
     message = data.get("message")
@@ -34,7 +41,7 @@ def chat_assistant(req: https_fn.CallableRequest) -> dict:
     client = genai.Client(
         vertexai=True, 
         project=os.environ.get("GOOGLE_CLOUD_PROJECT"), 
-        location=os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+        location=os.environ.get("GOOGLE_CLOUD_LOCATION", "europe-west1")
     )
 
     # Define the Search Tool function
